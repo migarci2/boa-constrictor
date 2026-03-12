@@ -230,10 +230,6 @@ def reconstruct_awkward(data: np.ndarray, meta: BinMeta) -> ak.Array:
 
 def write_root_from_awkward(path: str, tree_name: str, arrs: ak.Array) -> None:
 	with uproot.recreate(path) as f:
-		# Uproot prefers receiving a dict of branch-name -> array mappings.
-		# If `arrs` is an awkward array of records, convert to a dict so fields
-		# are written individually. This avoids broadcasting/nesting issues
-		# when a record's fields are jagged arrays.
 		try:
 			if isinstance(arrs, ak.Array) and getattr(arrs, "fields", None):
 				data = {name: arrs[name] for name in arrs.fields}
@@ -241,7 +237,21 @@ def write_root_from_awkward(path: str, tree_name: str, arrs: ak.Array) -> None:
 				data = arrs
 		except Exception:
 			data = arrs
-		f[tree_name] = data
+		if isinstance(data, dict):
+			f.mktree(tree_name, {name: branch_type(values) for name, values in data.items()})
+			f[tree_name].extend(data)
+		else:
+			f[tree_name] = data
+
+
+def branch_type(values):
+	if isinstance(values, np.ndarray):
+		return values.dtype
+
+	t = ak.type(values)
+	if isinstance(t, ak.types.ArrayType):
+		return t.content
+	return t
 
 
 def compare_trees(original: ak.Array, reconstructed: ak.Array, selected: List[str]) -> Tuple[bool, Dict[str, str]]:
@@ -251,14 +261,12 @@ def compare_trees(original: ak.Array, reconstructed: ak.Array, selected: List[st
 		a = original[name]
 		b = reconstructed[name]
 		try:
-			# detect list-like
 			la = ak.to_numpy(ak.num(a, axis=-1))
 			lb = ak.to_numpy(ak.num(b, axis=-1))
 			if not np.array_equal(la, lb):
 				ok = False
 				report[name] = "lengths differ"
 				continue
-			# compare content up to per-event length
 			max_len = int(la.max()) if la.size > 0 else 0
 			a_pad = ak.fill_none(ak.pad_none(a, max_len, clip=True), 0)
 			b_pad = ak.fill_none(ak.pad_none(b, max_len, clip=True), 0)
@@ -270,7 +278,6 @@ def compare_trees(original: ak.Array, reconstructed: ak.Array, selected: List[st
 			else:
 				report[name] = "ok"
 		except Exception:
-			# scalar branch
 			an = ak.to_numpy(a).astype(np.float64).reshape(-1)
 			bn = ak.to_numpy(b).astype(np.float64).reshape(-1)
 			if not np.allclose(an, bn, equal_nan=True):
@@ -282,17 +289,14 @@ def compare_trees(original: ak.Array, reconstructed: ak.Array, selected: List[st
 
 
 def write_rntuple_from_awkward(path, name, arrs, compression=uproot.ZSTD(7), chunk=100_000):
-    # arrs: awkward record array with fields as scalars or jagged lists
-    with uproot.recreate(path, compression=compression) as f:
-        # Build schema directly from Awkward types; jagged becomes "var * T"
-        schema = {k: ak.type(arrs[k]) for k in arrs.fields}
-        nt = f.mkrntuple(name, schema)   # creates the RNTuple
-        n = len(arrs)
-        for s in range(0, n, chunk):
-            e = min(s + chunk, n)
-            # slice event range and extend
-            nt.extend({k: arrs[k][s:e] for k in arrs.fields})
-    return os.path.getsize(path)
+	with uproot.recreate(path, compression=compression) as f:
+		schema = {k: branch_type(arrs[k]) for k in arrs.fields}
+		nt = f.mkrntuple(name, schema)
+		n = len(arrs)
+		for s in range(0, n, chunk):
+			e = min(s + chunk, n)
+			nt.extend({k: arrs[k][s:e] for k in arrs.fields})
+	return os.path.getsize(path)
 
 def main():
 	parser = argparse.ArgumentParser(description="CMS ROOT ↔ bin reversible pipeline with two modes")
@@ -448,4 +452,3 @@ def main():
 
 if __name__ == "__main__":
 	main()
-

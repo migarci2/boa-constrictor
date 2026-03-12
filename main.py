@@ -619,6 +619,7 @@ def main():
             base_name=f"{name}_{backbone}",
             device=device,
             chunks_count=config.get('compression', {}).get('chunks_count', 1000),
+            bits_list=quantization_bits,
             progress=progress,
             keep_artifacts=keep_benchmark_artifacts,
         )

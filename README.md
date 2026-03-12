@@ -105,9 +105,9 @@ splits: [0.8, 0.1, 0.1]
 
 Timings are printed when `--show-timings` is used. Progress bars respect `progress: true` (in config) unless `--no-progress` is passed.
 
-## Quick Colab benchmark
+## Quick benchmark
 
-If you want the shortest path in Google Colab, use [`colab_benchmark.py`](/home/dark/Desktop/Projects/boa-constrictor/colab_benchmark.py). It writes a config for you and launches `main.py` with `mingru`, verification, timings, and optional low-bit variants.
+If you want the shortest path to run a benchmark, use [`run_benchmark.py`](/home/xdarksyderx/boa-constrictor/run_benchmark.py). It writes a config for you and launches `main.py` with `mingru`, verification, timings, and optional low-bit variants.
 
 ```bash
 git clone <your-repo-url>
@@ -115,9 +115,9 @@ cd boa-constrictor
 python -m pip install -r requirements.txt
 
 # Put your binary at /content/data.bin first
-python colab_benchmark.py \
+python run_benchmark.py \
   --data /content/data.bin \
-  --name mingru_colab \
+  --name mingru_benchmark \
   --backbone mingru \
   --epochs 5 \
   --seq-len 4096 \
@@ -126,7 +126,7 @@ python colab_benchmark.py \
 ```
 
 Useful overrides:
-- `--gpu-streams 256` if Colab VRAM is tight.
+- `--gpu-streams 256` if VRAM is tight.
 - `--backbone mamba` to compare against the original model.
 - `--extra-main-args "--evaluate"` if you also want evaluation plots.
 - `--no-run` to only generate the YAML and inspect it first.

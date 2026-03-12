@@ -8,9 +8,9 @@ import yaml
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Generate and run a Colab-friendly BOA benchmark config.")
+    p = argparse.ArgumentParser(description="Generate and run a BOA benchmark config.")
     p.add_argument("--data", required=True, help="Path to the training/compression binary file.")
-    p.add_argument("--name", default="mingru_colab", help="Experiment name.")
+    p.add_argument("--name", default="mingru_benchmark", help="Experiment name.")
     p.add_argument("--backbone", default="mingru", choices=["mamba", "mingru"], help="Backbone to benchmark.")
     p.add_argument("--device", default="cuda", help="Torch device to use.")
     p.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "fp8"], help="Training precision.")
@@ -22,7 +22,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=5e-4, help="Learning rate.")
     p.add_argument("--chunks-count", type=int, default=1000, help="Number of compression chunks.")
     p.add_argument("--quant-bits", default="8,4", help="Comma-separated weight-only benchmark bitwidths.")
-    p.add_argument("--gpu-streams", type=int, default=512, help="BOA_GPU_STREAMS override for Colab runs.")
+    p.add_argument("--gpu-streams", type=int, default=512, help="BOA_GPU_STREAMS override.")
     p.add_argument("--compress-file", default="", help="Optional alternate file to compress.")
     p.add_argument("--extra-main-args", default="", help="Extra args appended to main.py, e.g. '--evaluate'.")
     p.add_argument("--no-run", action="store_true", help="Only write the config, do not launch main.py.")
@@ -83,9 +83,9 @@ def main():
     config = build_config(args, data_path)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
 
-    print(f"[colab] wrote config: {config_path}")
-    print(f"[colab] benchmark bits: {config['benchmark']['quantization_bits']}")
-    print(f"[colab] backbone: {args.backbone}")
+    print(f"[benchmark] wrote config: {config_path}")
+    print(f"[benchmark] benchmark bits: {config['benchmark']['quantization_bits']}")
+    print(f"[benchmark] backbone: {args.backbone}")
 
     if args.no_run:
         return
@@ -107,12 +107,12 @@ def main():
     if args.extra_main_args.strip():
         cmd.extend(args.extra_main_args.strip().split())
 
-    print("[colab] running:", " ".join(cmd))
+    print("[benchmark] running:", " ".join(cmd))
     subprocess.run(cmd, cwd=repo_root, env=env, check=True)
 
     report_path = exp_dir / f"{args.name}_benchmark_report.json"
     if report_path.exists():
-        print(f"[colab] benchmark report: {report_path}")
+        print(f"[benchmark] benchmark report: {report_path}")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@ import json
 import time
 from pathlib import Path
 
+import torch
+
 from boa import BOA
 from quantization import estimate_model_size_bytes, make_quantized_copy
 
@@ -79,10 +81,13 @@ def benchmark_quantized_variants(
     keep_artifacts: bool = False,
 ):
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     report = []
     for bits in bits_list:
         variant_model = make_quantized_copy(model, bits)
         variant_name = f"{base_name}_w{bits}"
+        model_path = output_dir / f"{variant_name}.pt"
+        torch.save(variant_model, model_path)
         metrics = run_boa_benchmark(
             variant_model,
             input_path=input_path,
@@ -94,6 +99,7 @@ def benchmark_quantized_variants(
             keep_artifacts=keep_artifacts,
         )
         metrics["weight_bits"] = int(bits)
+        metrics["model_path"] = str(model_path)
         report.append(metrics)
     return report
 
