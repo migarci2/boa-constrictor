@@ -69,6 +69,7 @@ dataloader:
   batch_size: 3
 
 model:
+  backbone: mamba  # or mingru for the recurrent PoC
   d_model: 256
   num_layers: 8
 
@@ -80,12 +81,17 @@ compression:
   chunks_count: 1000
   file_to_compress: ''
 
+benchmark:
+  quantization_bits: []  # example: [8, 4] for weight-only post-training benchmarks
+
 splits: [0.8, 0.1, 0.1]
 ```
 
 - `file_path` should point to the raw bytes file to train/encode.
 - `splits` should sum to 1.0; if not, defaults are applied.
 - `chunks_count` controls how many chunks are used during compression; see Performance notes below.
+- `model.backbone: mingru` swaps the predictor to the new recurrent PoC while keeping the same BOA/range-coder pipeline.
+- `benchmark.quantization_bits` runs extra weight-only low-bit roundtrips and writes a JSON report in the experiment directory.
 
 
 ## CLI overview
@@ -98,6 +104,37 @@ splits: [0.8, 0.1, 0.1]
 - Compression/Decompression via `BoaFile.compress(...)` / `BoaFile.decompress(...)`
 
 Timings are printed when `--show-timings` is used. Progress bars respect `progress: true` (in config) unless `--no-progress` is passed.
+
+## Quick Colab benchmark
+
+If you want the shortest path in Google Colab, use [`colab_benchmark.py`](/home/dark/Desktop/Projects/boa-constrictor/colab_benchmark.py). It writes a config for you and launches `main.py` with `mingru`, verification, timings, and optional low-bit variants.
+
+```bash
+git clone <your-repo-url>
+cd boa-constrictor
+python -m pip install -r requirements.txt
+
+# Put your binary at /content/data.bin first
+python colab_benchmark.py \
+  --data /content/data.bin \
+  --name mingru_colab \
+  --backbone mingru \
+  --epochs 5 \
+  --seq-len 4096 \
+  --batch-size 4 \
+  --quant-bits 8,4
+```
+
+Useful overrides:
+- `--gpu-streams 256` if Colab VRAM is tight.
+- `--backbone mamba` to compare against the original model.
+- `--extra-main-args "--evaluate"` if you also want evaluation plots.
+- `--no-run` to only generate the YAML and inspect it first.
+
+Outputs:
+- `experiments/<name>/<name>.boa`
+- `experiments/<name>/<name>_benchmark_report.json`
+- `experiments/<name>/quantized_benchmarks/` for low-bit variants
 
 
 ## Architecture and data flow

@@ -2,14 +2,15 @@ import argparse
 import os
 import time
 from pathlib import Path
-from networkx import config
 import yaml
 import numpy as np
 import torch
 from tqdm import tqdm
 
+from benchmarking import benchmark_quantized_variants, write_benchmark_report
 from model import BoaConstrictor, ByteDataloader, make_splits
 from boa import BOA
+from quantization import estimate_model_size_bytes
 from train import train
 
 
@@ -55,8 +56,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="Run BoaConstrictor experiments from a config file")
     p.add_argument('--config', '-c', type=Path, required=False, help='Path to YAML experiment config')
     p.add_argument('--no-progress', action='store_true', help='Disable progress bars')
-    p.add_argument('--device', type=str, default="cuda", help='Torch device override (cpu|cuda)')
-    p.add_argument('--precision', type=str, default="fp32", choices=['fp32','fp16', 'fp8'], help='Precision override')
+    p.add_argument('--device', type=str, default=None, help='Torch device override (cpu|cuda)')
+    p.add_argument('--precision', type=str, default=None, choices=['fp32','fp16', 'fp8'], help='Precision override')
+    p.add_argument('--backbone', type=str, default=None, choices=['mamba', 'mingru'], help='Model backbone override')
+    p.add_argument('--quantization-bits', type=str, default=None, help='Comma-separated weight-only benchmark variants, e.g. 8,4')
     p.add_argument('--new-experiment', action='store_true', help='Create a new experiment config interactively and run it')
     p.add_argument('--train-only', action='store_true', help='Only run training')
     p.add_argument('--compress-only', action='store_true', help='Only run compression')
@@ -68,6 +71,19 @@ def parse_args():
     p.add_argument('--comparison-baseline-only', action='store_true', help='Run LZMA and ZLIB (ultra) baseline compressions on the compression input file, print results, and exit')
     p.add_argument('--model-path', type=str, default=None, help='Path to a pre-trained model .pt file (state_dict or full model). If provided, training is skipped and the model is loaded')
     return p.parse_args()
+
+
+def _parse_bits_list(bits_arg):
+    if bits_arg is None:
+        return []
+    if isinstance(bits_arg, (list, tuple)):
+        return [int(x) for x in bits_arg]
+    if isinstance(bits_arg, str):
+        bits_arg = bits_arg.strip()
+        if not bits_arg:
+            return []
+        return [int(x.strip()) for x in bits_arg.split(',') if x.strip()]
+    return [int(bits_arg)]
 
 
 def main():
@@ -93,6 +109,7 @@ def main():
         progress = _prompt("Show progress bars (true/false)", "true", lambda s: s.lower() in ("1","true","yes"))
         device = _prompt("Device (cpu|cuda)", "cuda")
         precision = _prompt("Precision (fp32|fp16|fp8)", "fp32")
+        backbone = _prompt("Backbone (mamba|mingru)", "mamba")
         seq_len = _prompt("Sequence length (seq_len)", 32768, int)
         batch_size = _prompt("Batch size", 3, int)
         d_model = _prompt("Model d_model", 256, int)
@@ -100,6 +117,7 @@ def main():
         lr = _prompt("Learning rate", 5e-4, float)
         epochs = _prompt("Epochs", 10, int)
         chunks_count = _prompt("Compression chunks_count", 1000, int)
+        quant_bits = _prompt("Quantized benchmark bits (comma-separated or blank)", "", str)
         use_vocab_subset = _prompt("Use vocab subset (true/false)", "false", lambda s: s.lower() in ("1","true","yes"))
         compress_file = _prompt("File to compress (leave blank to use dataset file)", "", lambda s: s if s != "" else "")
         splits_in = _prompt("Data splits as comma-separated (train,val,test)", "0.8,0.1,0.1")
@@ -118,9 +136,10 @@ def main():
             'device': device,
             'precision': precision,
             'dataloader': {'seq_len': int(seq_len), 'batch_size': int(batch_size)},
-            'model': {'d_model': int(d_model), 'num_layers': int(num_layers)},
+            'model': {'d_model': int(d_model), 'num_layers': int(num_layers), 'backbone': backbone},
             'training': {'lr': float(lr), 'epochs': int(epochs)},
             'compression': {'chunks_count': int(chunks_count), 'file_to_compress': compress_file},
+            'benchmark': {'quantization_bits': _parse_bits_list(quant_bits)},
             'use_vocab_subset': bool(use_vocab_subset),
             'splits': splits
         }
@@ -145,11 +164,15 @@ def main():
 
     # Apply CLI overrides
     progress = not args.no_progress and config.get('progress', True)
-    device =  config.get('device', 'cuda' if torch.cuda.is_available() else 'cuda') or args.device
-    
-    print(device)
+    default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = args.device or config.get('device', default_device)
     precision = args.precision or config.get('precision', 'fp32')
+    backbone = args.backbone or config.get('model', {}).get('backbone', 'mamba')
+    benchmark_cfg = config.get('benchmark', {})
+    quantization_bits = _parse_bits_list(args.quantization_bits) if args.quantization_bits is not None else _parse_bits_list(benchmark_cfg.get('quantization_bits', []))
+    keep_benchmark_artifacts = bool(benchmark_cfg.get('keep_artifacts', False))
     verify = args.verify or bool(config.get('verify', False))
+    print(f"device={device} backbone={backbone} precision={precision}")
     # Model path can be provided via CLI or config (either top-level 'model_path' or under 'model.path')
     model_path_cfg = config.get('model_path') or config.get('model', {}).get('path')
     model_path = Path(args.model_path).expanduser() if args.model_path else (Path(model_path_cfg).expanduser() if model_path_cfg else None)
@@ -185,6 +208,9 @@ def main():
     lr = float(config.get('training', {}).get('lr', 5e-4))
     num_epochs = config.get('training', {}).get('epochs', 50)
     use_vocab_subset = config.get('use_vocab_subset', False)
+
+    if backbone == "mingru" and seq_len > 8192:
+        print("[WARN] MinGRU trains sequentially in this PoC. Consider seq_len in the 2048-8192 range for Colab-scale runs.")
 
     timings = {}
 
@@ -242,9 +268,23 @@ def main():
     experiments_root = Path(config.get('experiments_root', 'experiments'))
     exp_dir = experiments_root / name
     exp_dir.mkdir(parents=True, exist_ok=True)
+    benchmark_report = {
+        'experiment': name,
+        'backbone': backbone,
+        'device': device,
+        'precision': precision,
+        'quantization_mode': 'weight_only_fake_quant',
+        'variants': [],
+    }
 
     # Setup model, dataloaders, optimizer, loss
-    model = BoaConstrictor(d_model=d_model, num_layers=num_layers, vocab_size=vocab_size, device=device)
+    model = BoaConstrictor(
+        d_model=d_model,
+        num_layers=num_layers,
+        vocab_size=vocab_size,
+        device=device,
+        backbone=backbone,
+    )
 
     dataloader = ByteDataloader(data_bytes, seq_len=seq_len, batch_size=batch_size, device=device)
 
@@ -263,11 +303,21 @@ def main():
         if not path.exists():
             raise FileNotFoundError(f"Model file not found: {path}")
         obj = torch.load(path, map_location='cpu')
+        def _load_state_dict(state_dict):
+            info = model.load_state_dict(state_dict, strict=False)
+            missing = list(getattr(info, 'missing_keys', []))
+            unexpected = list(getattr(info, 'unexpected_keys', []))
+            if missing or unexpected:
+                print(f"[WARN] Checkpoint/model mismatch for backbone={backbone}: missing={len(missing)} unexpected={len(unexpected)}")
+                if missing:
+                    print(f"[WARN] First missing keys: {missing[:5]}")
+                if unexpected:
+                    print(f"[WARN] First unexpected keys: {unexpected[:5]}")
+            return model
         try:
             # Try state_dict first
             if isinstance(obj, dict) and all(isinstance(k, str) for k in obj.keys()):
-                model.load_state_dict(obj, strict=False)
-                return model
+                return _load_state_dict(obj)
             # If whole model was saved
             if hasattr(obj, 'state_dict') and hasattr(obj, 'parameters'):
                 return obj
@@ -275,8 +325,7 @@ def main():
             pass
         # Fallback: if torch.save was used with state_dict under a key
         if isinstance(obj, dict) and 'state_dict' in obj:
-            model.load_state_dict(obj['state_dict'], strict=False)
-            return model
+            return _load_state_dict(obj['state_dict'])
         raise ValueError(f"Unrecognized checkpoint format at {path}")
 
     # If no explicit model_path was provided, check for an existing final checkpoint
@@ -452,13 +501,16 @@ def main():
 
     boa = BOA(device, str(exp_dir / f"{name}.boa"), model)
     file_format = compress_file_path.suffix.lstrip('.') or 'bin'
+    target_compress_path = compress_file_path
+    temp_compress_path = None
+    benchmark_input_path = None
+    original_size = compress_file_path.stat().st_size
+    compression_ratio = None
+    roundtrip_ok = None
     # Compression
     if not args.train_only and not args.decompress_only and not args.evaluate_only:
         print("Starting compression...")
-        
-        target_compress_path = compress_file_path
-        temp_compress_path = None
-        
+
         if vocab_size < 256:
             print(f"Remapping compression input to {vocab_size} vocab size...")
             with open(compress_file_path, 'rb') as f:
@@ -478,6 +530,7 @@ def main():
                 target_compress_path = temp_compress_path
 
         if target_compress_path:
+            benchmark_input_path = target_compress_path
             t_start = time.perf_counter()
             # Create BOA that writes into the experiment directory
             boa.compress(
@@ -487,16 +540,13 @@ def main():
             )
             with open(exp_dir / f"{name}.boa", 'rb') as bf:
                 boa_size = len(bf.read())
-            with open(compress_file_path, 'rb') as rf:
-                original_size = len(rf.read())
             compression_ratio = original_size / boa_size if boa_size > 0 else float('inf')
             print(f"Compression ratio: {compression_ratio:.2f}")
 
             timings['compression'] = time.perf_counter() - t_start
+            timings['compression_throughput_mib_s'] = original_size / (1024 * 1024) / max(timings['compression'], 1e-12)
             print(f"Compression complete in {timings['compression']:.2f}s")
-            
-            if temp_compress_path and temp_compress_path.exists():
-                temp_compress_path.unlink()
+            print(f"Compression throughput: {timings['compression_throughput_mib_s']:.2f} MiB/s")
 
     # Decompression (write decompressed bytes into the experiment directory)
     if not args.train_only and not args.compress_only and not args.evaluate_only:
@@ -519,15 +569,16 @@ def main():
         with open(out_path, 'wb') as outf:
             outf.write(decompressed_bytes)
         timings['decompression'] = time.perf_counter() - t_start
+        timings['decompression_throughput_mib_s'] = original_size / (1024 * 1024) / max(timings['decompression'], 1e-12)
         print(f"Decompression complete in {timings['decompression']:.2f}s")
+        print(f"Decompression throughput: {timings['decompression_throughput_mib_s']:.2f} MiB/s")
+        with open(compress_file_path, 'rb') as rf:
+            ref_bytes = rf.read()
+        roundtrip_ok = decompressed_bytes == ref_bytes
 
         # Optional verification: compare decompressed bytes with original compression input
         if verify:
-            # Compare against the bytes we actually compressed (compress_file_path)
-            with open(compress_file_path, 'rb') as rf:
-                ref_bytes = rf.read()
-            same = decompressed_bytes == ref_bytes
-            if same:
+            if roundtrip_ok:
                 print(f"VERIFY: OK — decompressed output matches input ({len(decompressed_bytes)} bytes)")
             else:
                 # Provide small diagnostic: print sizes and first mismatch position (bounded)
@@ -541,6 +592,52 @@ def main():
                         if decompressed_bytes[i] != ref_bytes[i]:
                             print(f"  First differing byte at offset {i}: dec={decompressed_bytes[i]} input={ref_bytes[i]}")
                             break
+
+    if compression_ratio is not None:
+        benchmark_report['variants'].append({
+            'name': f"{name}_{backbone}_fp32",
+            'weight_bits': 32,
+            'model_size_bytes': estimate_model_size_bytes(model),
+            'original_size_bytes': original_size,
+            'compressed_size_bytes': os.path.getsize(exp_dir / f"{name}.boa"),
+            'compression_ratio': compression_ratio,
+            'compression_seconds': timings.get('compression'),
+            'decompression_seconds': timings.get('decompression'),
+            'compression_throughput_mib_s': timings.get('compression_throughput_mib_s'),
+            'decompression_throughput_mib_s': timings.get('decompression_throughput_mib_s'),
+            'roundtrip_ok': roundtrip_ok,
+            'boa_path': str(exp_dir / f"{name}.boa"),
+        })
+
+    if quantization_bits and benchmark_input_path and not args.compress_only and not args.decompress_only and not args.evaluate_only:
+        print(f"Running quantized BOA benchmarks for weight bits: {quantization_bits}")
+        quant_output_dir = exp_dir / "quantized_benchmarks"
+        quant_results = benchmark_quantized_variants(
+            model,
+            input_path=benchmark_input_path,
+            output_dir=quant_output_dir,
+            base_name=f"{name}_{backbone}",
+            device=device,
+            chunks_count=config.get('compression', {}).get('chunks_count', 1000),
+            progress=progress,
+            keep_artifacts=keep_benchmark_artifacts,
+        )
+        benchmark_report['variants'].extend(quant_results)
+        for item in quant_results:
+            print(
+                f"[quant w{item['weight_bits']}] ratio={item['compression_ratio']:.2f} "
+                f"enc={item['compression_throughput_mib_s']:.2f} MiB/s "
+                f"dec={item['decompression_throughput_mib_s']:.2f} MiB/s "
+                f"ok={item['roundtrip_ok']}"
+            )
+
+    if benchmark_report['variants']:
+        report_path = exp_dir / f"{name}_benchmark_report.json"
+        write_benchmark_report(report_path, benchmark_report)
+        print(f"Wrote benchmark report to {report_path}")
+
+    if temp_compress_path and temp_compress_path.exists():
+        temp_compress_path.unlink()
 
     # Note: configs are stored under experiments/<name>/<name>.yaml when created
     # and can be referenced by experiment name via --config <name>. No copy is necessary.
@@ -619,5 +716,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

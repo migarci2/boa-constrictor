@@ -41,7 +41,6 @@ if IS_CUDA:
         # GPU batch range encoder (no D2H for probs/symbols)
         # K = vocab_size for bytes
         vocab_size = model.embedding.num_embeddings
-        print(vocab_size)
         batch = gr.gpu.queue.RangeCoderBatch(N, vocab_size, maxL)
 
         # Streaming state

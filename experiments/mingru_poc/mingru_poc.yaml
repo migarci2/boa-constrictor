@@ -1,0 +1,27 @@
+name: mingru_poc
+file_path: /content/data.bin
+progress: true
+device: cuda
+precision: fp32
+
+dataloader:
+  seq_len: 4096
+  batch_size: 4
+
+model:
+  backbone: mingru
+  d_model: 256
+  num_layers: 4
+
+training:
+  lr: 5.0e-4
+  epochs: 5
+
+compression:
+  chunks_count: 1000
+  file_to_compress: ''
+
+benchmark:
+  quantization_bits: [8, 4]
+
+splits: [0.8, 0.1, 0.1]
